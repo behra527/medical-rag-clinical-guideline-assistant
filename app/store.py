@@ -7,7 +7,16 @@ from pathlib import Path
 from typing import Any
 import numpy as np
 
-STOPWORDS = {'a', 'an', 'the', 'of', 'for', 'and', 'with', 'about', 'what', 'when', 'how', 'are', 'does', 'should', 'can', 'in', 'to', 'is', 'it', 'on', 'at', 'by', 'me', 'do', 'we', 'from', 'according', 'guideline', 'guidelines', 'who', 'which', 'where'}
+STOPWORDS = {'a', 'an', 'the', 'of', 'for', 'and', 'with', 'about', 'what', 'when', 'how', 'are', 'does', 'should', 'can', 'in', 'to', 'is', 'it', 'on', 'at', 'by', 'me', 'do', 'we', 'from', 'according', 'guideline', 'guidelines', 'who', 'which', 'where', 'this', 'that', 'those', 'these', 'they', 'them', 'also', 'same'}
+# Short clinical abbreviations expanded only for the rerank overlap, not stored as new text.
+QUERY_EXPANSIONS = {
+    'bp': ('blood', 'pressure'),
+    'abpm': ('ambulatory', 'monitoring'),
+    'hbpm': ('home', 'monitoring'),
+    'htn': ('hypertension',),
+    'sbp': ('systolic',),
+    'dbp': ('diastolic',),
+}
 
 
 def normalize(vectors: np.ndarray) -> np.ndarray:
@@ -104,7 +113,7 @@ class KnowledgeStore:
                 db.execute("DELETE FROM configuration WHERE key='embedding_model'")
             return count > 0
 
-    def search(self, query: str, query_vector: np.ndarray, *, top_k: int, min_similarity: float) -> list[dict[str, Any]]:
+    def search(self, query: str, query_vector: np.ndarray, *, top_k: int, min_similarity: float, document_id: str | None = None, section: str | None = None) -> list[dict[str, Any]]:
         query_vector = normalize(query_vector)[0]
         with self.connect() as db:
             rows = [dict(r) for r in db.execute('''
@@ -117,8 +126,13 @@ class KnowledgeStore:
                 raise ValueError('Query embedding dimensions differ from index')
             embeddings = np.vstack([np.frombuffer(r['vector'], dtype='<f4') for r in rows])
             similarity = embeddings @ query_vector
+            wanted_section = (section or '').strip().lower()
             candidates = []
             for row, score in zip(rows, similarity):
+                if document_id and row['document_id'] != document_id:
+                    continue
+                if wanted_section and not str(row.get('section', '')).lower().startswith(wanted_section):
+                    continue
                 if float(score) >= min_similarity:
                     row.pop('vector', None)
                     row.pop('dimensions', None)
@@ -139,10 +153,14 @@ class KnowledgeStore:
                         lexical_rank[r['id']] = i
                 except sqlite3.OperationalError:
                     pass
+            terms, numbers = _rerank_features(query)
             for row in candidates:
                 sid = row['id']
                 row['hybrid_score'] = round(1 / (60 + semantic_rank[sid]) + (1 / (60 + lexical_rank[sid]) if sid in lexical_rank else 0), 6)
-            candidates.sort(key=lambda r: (r['hybrid_score'], r['similarity']), reverse=True)
+                term_score, number_score = _passage_overlap(row.get('text', ''), row.get('section', ''), terms, numbers)
+                # Second-stage rerank: keep cosine dominant, then lexical coverage, then exact numbers.
+                row['rerank_score'] = round(0.62 * row['similarity'] + 0.23 * term_score + 0.15 * number_score, 4)
+            candidates.sort(key=lambda r: (r['rerank_score'], r['similarity'], r['hybrid_score']), reverse=True)
             return candidates[:top_k]
 
     def record_feedback(self, vote: str) -> None:
@@ -155,3 +173,34 @@ class KnowledgeStore:
         with self.connect() as db:
             rows = db.execute('SELECT vote, COUNT(*) AS count FROM feedback GROUP BY vote')
             return {r['vote']: r['count'] for r in rows}
+
+
+def _rerank_features(query: str) -> tuple[list[str], list[str]]:
+    raw = re.findall(r'[a-z0-9]+', query.lower())
+    terms: list[str] = []
+    for token in raw:
+        if token in STOPWORDS or len(token) < 3 or token.isdigit():
+            continue
+        terms.append(token)
+        terms.extend(QUERY_EXPANSIONS.get(token, ()))
+    numbers = [re.sub(r'\s+', '', n) for n in re.findall(r'\d+(?:\s*/\s*\d+)?', query)]
+    return list(dict.fromkeys(terms))[:24], list(dict.fromkeys(numbers))[:8]
+
+
+def _passage_overlap(text: str, section: str, terms: list[str], numbers: list[str]) -> tuple[float, float]:
+    hay = f'{section}\n{text}'.lower()
+    compact = re.sub(r'\s+', '', hay)
+    if terms:
+        hits = 0
+        for term in terms:
+            stem = term[:5] if len(term) >= 5 else term
+            if term in hay or (len(stem) >= 4 and stem in hay):
+                hits += 1
+        term_score = hits / len(terms)
+    else:
+        term_score = 0.0
+    if numbers:
+        number_score = sum(1 for number in numbers if number in compact) / len(numbers)
+    else:
+        number_score = 0.0
+    return term_score, number_score

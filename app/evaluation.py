@@ -107,6 +107,109 @@ def run_evaluation(rag, cases: list[dict], include_generation: bool = True, judg
             }, 'cases': result_rows}
 
 
+def _passage_status(retrieved: list[dict], case: dict) -> str:
+    expected_abstain = bool(case.get('should_abstain', False))
+    if expected_abstain:
+        return 'irrelevant' if retrieved else 'correct_abstain'
+    if not retrieved:
+        return 'insufficient'
+    expected_section = case.get('gold_section', '')
+    expected_doc = case.get('gold_document', '')
+    hit = any((not expected_doc or expected_doc.lower() in row['title'].lower()) and (not expected_section or str(row['section']).startswith(expected_section)) for row in retrieved)
+    return 'relevant' if hit else 'irrelevant'
+
+
+def sweep_retrieval(rag, cases: list[dict], top_ks: list[int], thresholds: list[float]) -> dict:
+    """Reuse one embedding per question across the top-k and threshold grid."""
+    if not cases:
+        raise ValueError('Empty evaluation set')
+    if not top_ks or not thresholds or len(top_ks) > 5 or len(thresholds) > 5:
+        raise ValueError('Provide 1 to 5 top-k values and 1 to 5 thresholds')
+    if any(not 1 <= int(k) <= 20 for k in top_ks) or any(not 0 <= float(t) <= 1 for t in thresholds):
+        raise ValueError('top-k must be 1–20 and similarity must be within 0–1')
+    from .rag import validate_question
+    prepared = []
+    has_docs = bool(rag.store.list_documents())
+    if has_docs:
+        rag.store.check_embedding_model(rag.settings.embed_model)
+    for case in cases:
+        question = validate_question(case['question'])
+        embedding = rag.client.embed([question])[0] if has_docs else None
+        prepared.append((case, question, embedding))
+    cells = []
+    focus = None
+    for top_k in top_ks:
+        for threshold in thresholds:
+            counts = {'relevant': 0, 'irrelevant': 0, 'insufficient': 0, 'correct_abstain': 0}
+            problems = []
+            for case, question, embedding in prepared:
+                retrieved = [] if embedding is None else rag.store.search(question, embedding, top_k=int(top_k), min_similarity=float(threshold))
+                status = _passage_status(retrieved, case)
+                counts[status] += 1
+                if status in ('irrelevant', 'insufficient'):
+                    top = retrieved[0] if retrieved else None
+                    problems.append({
+                        'question': question, 'status': status,
+                        'gold_section': case.get('gold_section', ''),
+                        'top_section': top['section'] if top else '',
+                        'top_similarity': top['similarity'] if top else None,
+                    })
+            graded = counts['relevant'] + counts['irrelevant'] + counts['insufficient']
+            cell = {
+                'top_k': int(top_k), 'min_similarity': float(threshold), **counts,
+                'relevant_rate': round(counts['relevant'] / graded, 3) if graded else None,
+                'problems': problems,
+            }
+            cells.append(cell)
+            if top_k == 5 and abs(float(threshold) - 0.4) < 1e-9:
+                focus = cell
+    if focus is None:
+        focus = cells[0]
+    return {
+        'n_cases': len(cases), 'cells': [{k: v for k, v in cell.items() if k != 'problems'} | {'problem_count': len(cell['problems'])} for cell in cells],
+        'problems': focus['problems'],
+        'focus': {'top_k': focus['top_k'], 'min_similarity': focus['min_similarity']},
+        'note': 'relevant = gold section is inside top-k. irrelevant = passages came back for the wrong section, or for a question that should abstain. insufficient = nothing passed the threshold.',
+    }
+
+
+def compare_prompts(rag, cases: list[dict], prompt_names: list[str]) -> dict:
+    from .rag import PROMPTS
+    if not cases:
+        raise ValueError('Empty evaluation set')
+    if not prompt_names or any(name not in PROMPTS for name in prompt_names):
+        raise ValueError('Prompt must be strict, concise, or baseline')
+    variants = []
+    for name in prompt_names:
+        rows = []
+        for case in cases:
+            response = rag.chat(case['question'], prompt=name)
+            expected = [term.lower() for term in case.get('expected_terms', [])]
+            coverage = None
+            if expected and not response['abstained']:
+                text = response['answer'].lower()
+                coverage = round(sum(term in text for term in expected) / len(expected), 3)
+            rows.append({
+                'question': case['question'], 'abstained': response['abstained'],
+                'unsupported_claims': len(response.get('unsupported_claims') or []),
+                'expected_term_coverage': coverage,
+                'citation_present': bool(response.get('sources')),
+                'answer': response['answer'],
+            })
+        answered = [row for row in rows if row['expected_term_coverage'] is not None]
+        variants.append({
+            'prompt': name,
+            'metrics': {
+                'abstentions': sum(1 for row in rows if row['abstained']),
+                'unsupported_claims': sum(row['unsupported_claims'] for row in rows),
+                'expected_term_coverage': round(mean(row['expected_term_coverage'] for row in answered), 3) if answered else None,
+                'citation_presence_rate': round(mean(row['citation_present'] for row in rows if not row['abstained']), 3) if any(not row['abstained'] for row in rows) else None,
+            },
+            'cases': rows,
+        })
+    return {'variants': variants, 'note': 'Same questions, different instructions. Unsupported claims are sentences removed because a number, acronym, or page was not in the cited passage.'}
+
+
 def load_dataset(path: str):
     data = json.loads(Path(path).read_text(encoding='utf-8'))
     if not isinstance(data, list) or not all(isinstance(c, dict) and 'question' in c for c in data):

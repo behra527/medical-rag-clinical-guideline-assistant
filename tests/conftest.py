@@ -51,10 +51,24 @@ class FakeOpenRouter:
         self.calls += 1
         return self.answer
 
+    def complete_stream(self, messages, **kwargs):
+        text = self.complete(messages, **kwargs)
+        step = 12
+        for start in range(0, len(text), step):
+            yield text[start:start + step]
+
+
+@pytest.fixture(autouse=True)
+def _reset_request_limits():
+    from app import api as routes
+    routes.reset_rate_limit()
+    yield
+    routes.reset_rate_limit()
+
 
 @pytest.fixture
 def rag(tmp_path):
-    settings = Settings(api_key='fake-key', db_path=str(tmp_path / 'index.db'),
+    settings = Settings(api_key='fake-key', admin_api_key='', db_path=str(tmp_path / 'index.db'),
                         pdf_dir=str(tmp_path / 'pdfs'),
                         min_similarity=.5, top_k=4, chunk_words=55, chunk_overlap=10)
     client = FakeOpenRouter()

@@ -59,7 +59,7 @@ def test_valid_grounded_answer(rag):
     assert not response['abstained']
     assert response['sources'][0]['id'] == 'S1'
     assert response['sources'][0]['page'] in [1, 2]
-    assert '[S1]' in response['answer']
+    assert '[S1 p.' in response['answer'] and '§' in response['answer']
 
 
 def test_hallucinated_citation_is_rejected(rag):
@@ -69,6 +69,52 @@ def test_hallucinated_citation_is_rejected(rag):
     assert response['reason'] == 'citation_validation_failed'
     rag.client.answer = 'No citation here.'
     assert rag.chat('How do I diagnose blood pressure?')['abstained']
+
+
+def test_rerank_prefers_passage_with_query_number(rag):
+    rows = rag.retrieve('treatment target for adults aged 80')
+    assert rows
+    assert rows[0]['section'].startswith('1.4')
+    assert 'rerank_score' in rows[0]
+
+
+def test_unsupported_claim_sentence_is_removed(rag):
+    rag.client.answer = 'ABPM is recommended [S1]. The target is 500/500 mmHg [S1].'
+    response = rag.chat('How do I diagnose blood pressure?')
+    assert response['abstained'] is False
+    assert '500' not in response['answer']
+    assert '[S1 p.' in response['answer']
+    assert response['unsupported_claims'][0]['reason'] == 'number_not_in_source'
+
+
+def test_claim_with_unknown_term_abstains(rag):
+    rag.client.answer = 'Use XYZQ daily [S1].'
+    response = rag.chat('How do I diagnose blood pressure?')
+    assert response['abstained'] is True
+    assert response['reason'] == 'claim_support_failed'
+
+
+def test_follow_up_merges_previous_question(rag):
+    rag.client.answer = 'In older adults aged 80 the treatment target may differ [S1].'
+    response = rag.chat('What about adults aged 80?', history=[{'question': 'How is blood pressure treated?'}])
+    assert response['follow_up'] is True
+    assert '80' in response['standalone_question']
+    assert 'blood pressure' in response['standalone_question'].lower()
+    assert any(source['section'].startswith('1.4') for source in response['sources'])
+
+
+def test_invented_page_number_is_removed(rag):
+    rag.client.answer = 'ABPM is recommended [S1]. See page 99 [S1].'
+    response = rag.chat('How do I diagnose blood pressure?')
+    assert 'page 99' not in response['answer']
+    assert response['unsupported_claims'][0]['reason'] == 'page_not_in_source'
+
+
+def test_section_metadata_filter(rag):
+    document_id = rag.store.list_documents()[0]['id']
+    rows = rag.retrieve('blood pressure in adults', document_id=document_id, section='1.4')
+    assert rows and all(row['section'].startswith('1.4') for row in rows)
+    assert rag.retrieve('blood pressure in adults', section='9.9') == []
 
 
 def test_delete_document_and_clear_embedding_model(rag):

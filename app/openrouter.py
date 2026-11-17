@@ -1,5 +1,6 @@
 """OpenRouter native REST calls: embeddings and chat (no hidden local model)."""
 from __future__ import annotations
+import json
 import time
 import httpx
 import numpy as np
@@ -72,3 +73,41 @@ class OpenRouterClient:
             raise ValueError('Unexpected message format')
         except (KeyError, IndexError, TypeError, ValueError) as exc:
             raise OpenRouterError('OpenRouter generated an invalid completion') from exc
+
+    def complete_stream(self, messages: list[dict], *, temperature: float = 0.0, max_tokens: int = 800):
+        if not self.settings.api_key or self.settings.api_key == 'replace_with_your_key':
+            raise OpenRouterError('Set OPENROUTER_API_KEY in .env before indexing or chatting')
+        headers = {
+            'Authorization': f'Bearer {self.settings.api_key}',
+            'Content-Type': 'application/json',
+            'X-OpenRouter-Title': 'Clinical RAG Assistant',
+        }
+        payload = {
+            'model': self.settings.chat_model,
+            'temperature': temperature,
+            'max_tokens': max_tokens,
+            'messages': messages,
+            'stream': True,
+        }
+        try:
+            with self.client.stream('POST', f'{self.settings.base_url}/chat/completions', headers=headers, json=payload) as response:
+                if response.status_code >= 400:
+                    raise OpenRouterError(f'OpenRouter request failed: HTTP {response.status_code}; check key, model, and credits')
+                for line in response.iter_lines():
+                    if not line or not line.startswith('data:'):
+                        continue
+                    data = line[5:].strip()
+                    if data == '[DONE]':
+                        break
+                    try:
+                        chunk = json.loads(data)
+                        delta = chunk['choices'][0].get('delta') or {}
+                        text = delta.get('content') or ''
+                    except (KeyError, IndexError, TypeError, ValueError, json.JSONDecodeError) as exc:
+                        raise OpenRouterError('OpenRouter stream was invalid') from exc
+                    if text:
+                        yield text
+        except OpenRouterError:
+            raise
+        except (httpx.TimeoutException, httpx.NetworkError) as exc:
+            raise OpenRouterError(f'OpenRouter network error: {type(exc).__name__}') from exc

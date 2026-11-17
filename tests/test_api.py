@@ -12,7 +12,13 @@ def test_http_endpoints_with_fake_provider(rag, monkeypatch):
     assert client.get('/documents').json()[0]['title'].startswith('NICE NG136')
     assert client.post('/retrieve', json={'question': 'Diagnosing blood pressure in adults?'}).json()['results']
     ans = client.post('/chat', json={'question': 'Diagnosing blood pressure in adults?'})
-    assert ans.status_code == 200 and '[S1]' in ans.json()['answer']
+    assert ans.status_code == 200 and '[S1 p.' in ans.json()['answer']
+    follow = client.post('/chat', json={'question': 'What about adults aged 80?', 'history': [{'question': 'How is blood pressure treated?'}]})
+    assert follow.status_code == 200 and follow.json()['follow_up'] is True
+    streamed = client.post('/chat', json={'question': 'Diagnosing blood pressure in adults?', 'stream': True})
+    assert streamed.status_code == 200
+    assert 'text/event-stream' in streamed.headers['content-type']
+    assert 'event: done' in streamed.text and '[S1 p.' in streamed.text
     invalid = client.post('/chat', json={'question':'  '})
     assert invalid.status_code == 400
     assert client.post('/chat', json={'question':'How do I fix my car engine?'}).json()['abstained']
