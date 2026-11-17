@@ -1,5 +1,5 @@
 
-# Medical RAG — Clinical Guideline Assistant
+# Medical RAG  Clinical Guideline Assistant
 
 ![Python](https://img.shields.io/badge/Python-3.11-3776AB?logo=python&logoColor=white)
 ![FastAPI](https://img.shields.io/badge/FastAPI-009688?logo=fastapi&logoColor=white)
@@ -141,6 +141,3 @@ This project is intended for educational and research purposes.
 
 It is not a substitute for professional medical advice, diagnosis, or treatment. All AI-generated information should be reviewed by qualified healthcare professionals before clinical use.
 
----
-
-**Medical RAG — Building reliable AI systems through retrieval, verification, and evidence-grounded generation.**
